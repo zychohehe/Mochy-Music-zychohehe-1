@@ -1,0 +1,164 @@
+name: Build & Release APK
+
+# Every push to main builds a signed release APK and publishes it as a GitHub Release,
+# so the in-app updater (and anyone on the Releases page) always gets the newest build.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "fastlane/**"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# a newer push replaces a build that is still running
+concurrency:
+  group: release
+  cancel-in-progress: true
+
+env:
+  # build numbers continue from the version in app/build.gradle.kts, +1 per workflow run
+  BASE_BUILD: 1280
+  BASE_CODE: 73
+
+jobs:
+  meta:
+    name: Work out the version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      build: ${{ steps.v.outputs.build }}
+      code: ${{ steps.v.outputs.code }}
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: v
+        run: |
+          VERSION=$(grep -oP 'versionName = "\K[0-9]+\.[0-9]+\.[0-9]+' app/build.gradle.kts | head -1)
+          BUILD=$((BASE_BUILD + GITHUB_RUN_NUMBER))
+          CODE=$((BASE_CODE + GITHUB_RUN_NUMBER))
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "build=$BUILD"     >> "$GITHUB_OUTPUT"
+          echo "code=$CODE"       >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}-build${BUILD}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.abi }}
+    needs: meta
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # arm64 is what nearly every phone made since 2016 runs: the lightest, fastest build
+          - abi: arm64
+            task: assembleArm64FossRelease
+            dir: arm64Foss
+          # universal works on every device, 32-bit and emulators included
+          - abi: universal
+            task: assembleUniversalFossRelease
+            dir: universalFoss
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          java-version: "21"
+          distribution: temurin
+
+      - name: Set up Gradle (with cache)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-cleanup: on-success
+
+      - name: Install NDK and CMake
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;27.0.12077973" "cmake;3.22.1" > /dev/null
+
+      - name: Prepare signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          STORE_PASSWORD_SECRET: ${{ secrets.STORE_PASSWORD }}
+          KEY_ALIAS_SECRET: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD_SECRET: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          mkdir -p app/keystore
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "Using the signing key from repository secrets"
+            echo "$KEYSTORE_BASE64" | base64 -d > app/keystore/release.keystore
+            echo "STORE_PASSWORD=$STORE_PASSWORD_SECRET" >> "$GITHUB_ENV"
+            echo "KEY_ALIAS=$KEY_ALIAS_SECRET"           >> "$GITHUB_ENV"
+            echo "KEY_PASSWORD=$KEY_PASSWORD_SECRET"     >> "$GITHUB_ENV"
+          else
+            echo "No secrets set, using the fallback key in .github/signing (same key every build, so updates install over each other)"
+            base64 -d .github/signing/release.keystore.b64 > app/keystore/release.keystore
+            echo "STORE_PASSWORD=mochyfork" >> "$GITHUB_ENV"
+            echo "KEY_ALIAS=mochy"          >> "$GITHUB_ENV"
+            echo "KEY_PASSWORD=mochyfork"   >> "$GITHUB_ENV"
+          fi
+
+      - name: Build release APK
+        env:
+          LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
+          LASTFM_SECRET: ${{ secrets.LASTFM_SECRET }}
+          LIBREFM_API_KEY: ${{ secrets.LIBREFM_API_KEY }}
+          LIBREFM_SECRET: ${{ secrets.LIBREFM_SECRET }}
+          DISCORD_CLIENT_ID: ${{ secrets.DISCORD_CLIENT_ID }}
+          DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
+          ONEDRIVE_CLIENT_ID: ${{ secrets.ONEDRIVE_CLIENT_ID }}
+        run: |
+          chmod +x gradlew
+          ./gradlew ${{ matrix.task }} \
+            -PbuildNumber=${{ needs.meta.outputs.build }} \
+            -PversionCodeOverride=${{ needs.meta.outputs.code }} \
+            --console=plain --warning-mode summary
+
+      - name: Name the APK
+        run: |
+          mkdir -p dist
+          APK=$(ls app/build/outputs/apk/${{ matrix.dir }}/release/*.apk | head -1)
+          cp "$APK" "dist/Mochy-Music_v${{ needs.meta.outputs.version }}_build${{ needs.meta.outputs.build }}_${{ matrix.abi }}.apk"
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ matrix.abi }}
+          path: dist/*.apk
+          retention-days: 1
+
+  release:
+    name: Publish release
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: apk-*
+          merge-multiple: true
+          path: dist
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum *.apk > sha256sums.txt
+          cat sha256sums.txt
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ needs.meta.outputs.tag }}" dist/* \
+            --target "${{ github.sha }}" \
+            --title "${{ needs.meta.outputs.version }} build#${{ needs.meta.outputs.build }}" \
+            --generate-notes \
+            --latest
